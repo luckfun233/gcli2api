@@ -52,6 +52,22 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.error(f"配置缓存初始化失败: {e}")
 
+    # 安全加固：检测弱默认密码并告警（不阻断启动，尊重原项目设计）
+    try:
+        api_pwd = await config.get_api_password()
+        panel_pwd = await config.get_panel_password()
+        if (api_pwd == "pwd") or (panel_pwd == "pwd"):
+            log.warning("=" * 60)
+            log.warning("⚠️  安全告警：检测到默认弱密码 'pwd'")
+            log.warning("⚠️  请通过环境变量配置强密码：")
+            log.warning("⚠️    export API_PASSWORD=<强随机字符串>")
+            log.warning("⚠️    export PANEL_PASSWORD=<强随机字符串>")
+            log.warning("⚠️  或使用通用密码：export PASSWORD=<强随机字符串>")
+            log.warning("⚠️  默认密码会被公网扫描器在 1 秒内爆破成功")
+            log.warning("=" * 60)
+    except Exception as e:
+        log.debug(f"密码检测失败: {e}")
+
     # 初始化全局凭证管理器（通过单例工厂）
     try:
         # credential_manager 会在第一次调用时自动初始化
@@ -100,18 +116,26 @@ async def lifespan(app: FastAPI):
 
 
 # 创建FastAPI应用
+# 安全加固：关闭 OpenAPI 文档（/docs /redoc /openapi.json）防止暴露 API 结构
 app = FastAPI(
     title="GCLI2API",
     description="Gemini API proxy with OpenAI compatibility",
     version="2.0.0",
     lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 # CORS中间件
+# 安全加固：移除 allow_credentials=True。
+# 规范禁止 allow_origins=["*"] 与 allow_credentials=True 同时使用，
+# 此处作为 API 代理服务（客户端不固定），保留通配 origin 但不带 credentials，
+# 浏览器会拒绝跨域携带 Cookie，避免 CSRF。
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
