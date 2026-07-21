@@ -2,7 +2,10 @@
 认证路由模块 - 处理 /auth/* 相关的HTTP请求
 """
 
-from fastapi import APIRouter, Depends, HTTPException
+import time
+from collections import defaultdict
+
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from log import log
@@ -25,15 +28,62 @@ from src.utils import verify_panel_token
 # 创建路由器
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+# 简易登录暴力破解防护：每 IP 在窗口内最多失败 N 次，超过则冷却
+_LOGIN_WINDOW_SEC = 300  # 5 分钟窗口
+_LOGIN_MAX_FAILURES = 10  # 窗口内最多失败次数
+_LOGIN_COOLDOWN_SEC = 600  # 触发后冷却 10 分钟
+_login_failures: dict[str, list[float]] = defaultdict(list)
+_login_blocked_until: dict[str, float] = {}
+
+
+def _login_check_blocked(client_ip: str) -> bool:
+    """检查 IP 是否在冷却期内。返回 True 表示被阻止。"""
+    blocked_until = _login_blocked_until.get(client_ip, 0)
+    if blocked_until and time.time() < blocked_until:
+        return True
+    # 冷却期已过，清理
+    if blocked_until:
+        _login_blocked_until.pop(client_ip, None)
+        _login_failures.pop(client_ip, None)
+    return False
+
+
+def _login_record_failure(client_ip: str) -> None:
+    """记录一次登录失败，超过阈值则进入冷却。"""
+    now = time.time()
+    failures = _login_failures[client_ip]
+    # 清理过期记录
+    _login_failures[client_ip] = [t for t in failures if now - t < _LOGIN_WINDOW_SEC]
+    _login_failures[client_ip].append(now)
+    if len(_login_failures[client_ip]) >= _LOGIN_MAX_FAILURES:
+        _login_blocked_until[client_ip] = now + _LOGIN_COOLDOWN_SEC
+        log.warning(f"登录暴力破解防护触发: ip={client_ip} 冷却 {_LOGIN_COOLDOWN_SEC}s")
+
+
+def _login_clear_failures(client_ip: str) -> None:
+    """登录成功后清理失败记录。"""
+    _login_failures.pop(client_ip, None)
+    _login_blocked_until.pop(client_ip, None)
+
 
 @router.post("/login")
-async def login(request: LoginRequest):
-    """用户登录（简化版：直接返回密码作为token）"""
+async def login(request: LoginRequest, http_request: Request):
+    """用户登录（简化版：直接返回密码作为token）
+
+    安全加固：每 IP 5 分钟内最多失败 10 次，超过则冷却 10 分钟。
+    """
     try:
+        client_ip = http_request.client.host if http_request.client else "unknown"
+        if _login_check_blocked(client_ip):
+            log.warning(f"登录被限流: ip={client_ip}")
+            raise HTTPException(status_code=429, detail="登录尝试过于频繁，请稍后再试")
+
         if await verify_password(request.password):
+            _login_clear_failures(client_ip)
             # 直接使用密码作为token，简化认证流程
             return JSONResponse(content={"token": request.password, "message": "登录成功"})
         else:
+            _login_record_failure(client_ip)
             raise HTTPException(status_code=401, detail="密码错误")
     except HTTPException:
         raise
