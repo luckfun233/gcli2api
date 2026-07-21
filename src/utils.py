@@ -1,5 +1,7 @@
 from typing import List, Optional
 
+import secrets
+
 from config import get_api_password, get_panel_password
 from fastapi import Depends, HTTPException, Header, Query, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -7,6 +9,17 @@ from log import log
 
 # HTTP Bearer security scheme
 security = HTTPBearer()
+
+# 安全加固：默认弱密码黑名单。当配置密码为此列表中的值时，所有鉴权一律拒绝。
+# 与 src/auth.py 保持一致，避免公网部署时使用默认 "pwd" 导致 1 秒被爆破。
+_WEAK_DEFAULT_PASSWORDS = {"pwd", "", "password", "admin", "123456", "12345678"}
+
+
+def _is_weak_password(password: Optional[str]) -> bool:
+    """判断密码是否为不安全的弱默认值（必须拒绝）。"""
+    if not password:
+        return True
+    return password in _WEAK_DEFAULT_PASSWORDS
 
 # ====================== OAuth Configuration ======================
 
@@ -198,6 +211,18 @@ async def authenticate_flexible(
     token = None
     auth_method = None
 
+    # 安全加固：拒绝默认弱密码。若服务端密码为默认 "pwd" 等弱值，
+    # 一律拒绝所有 API 调用，避免公网部署被秒破。
+    if _is_weak_password(password):
+        log.error(
+            "拒绝 API 鉴权：服务端配置了默认弱密码（pwd/空等）。"
+            "请通过环境变量 API_PASSWORD/PASSWORD 配置强密码后重启服务。"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="服务端未配置访问密码，拒绝访问。请联系管理员设置 API_PASSWORD 环境变量。",
+        )
+
     # 1. 尝试从 URL 参数 key 获取（Google 官方标准方式）
     if key:
         token = key
@@ -246,15 +271,15 @@ async def authenticate_flexible(
             detail="Missing authentication credentials. Use 'key' URL parameter, 'x-goog-api-key', 'x-anthropic-auth-token', 'anthropic-auth-token', 'x-api-key', 'access_token' header, or 'Authorization: Bearer <token>'",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
-    # 验证 token
-    if token != password:
+
+    # 验证 token：使用常量时间比较防止时序攻击
+    if not secrets.compare_digest(token, password):
         log.debug(f"Authentication failed using {auth_method}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="密码错误"
         )
-    
+
     log.debug(f"Authentication successful using {auth_method}")
     return token
 
@@ -272,6 +297,10 @@ async def verify_panel_token(credentials: HTTPAuthorizationCredentials = Depends
 
     直接验证Bearer token是否等于控制面板密码
 
+    安全加固：
+    1. 拒绝默认弱密码 "pwd" 等，公网部署必须配置强密码。
+    2. 使用 secrets.compare_digest 进行常量时间比较，防止时序侧信道攻击。
+
     Args:
         credentials: HTTPAuthorizationCredentials 自动注入
 
@@ -283,6 +312,19 @@ async def verify_panel_token(credentials: HTTPAuthorizationCredentials = Depends
     """
 
     password = await get_panel_password()
-    if credentials.credentials != password:
+
+    # 拒绝默认弱密码：未配置强密码时一律拒绝面板访问
+    if _is_weak_password(password):
+        log.error(
+            "拒绝面板访问：检测到默认弱密码（pwd/空等）。"
+            "请通过环境变量 PANEL_PASSWORD/PASSWORD 配置强密码后重启服务。"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="服务端未配置面板密码，拒绝访问。请联系管理员设置 PANEL_PASSWORD 环境变量。",
+        )
+
+    # 常量时间比较，防止时序攻击
+    if not secrets.compare_digest(credentials.credentials, password):
         raise HTTPException(status_code=401, detail="密码错误")
     return credentials.credentials

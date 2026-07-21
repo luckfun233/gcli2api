@@ -3,6 +3,7 @@
 """
 
 import os
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
@@ -22,6 +23,17 @@ router = APIRouter(prefix="/config", tags=["config"])
 # 密码占位符：前端展示用，保存时若值为此占位符或为空则跳过更新
 _PASSWORD_PLACEHOLDER = "********"
 _DEFAULT_WEAK_PASSWORD = "pwd"
+
+# 安全加固：与 src/auth.py、src/utils.py 保持一致的弱密码黑名单。
+# 通过 /config/save 设置这些值时一律拒绝，避免运维误操作把服务变成裸奔状态。
+_WEAK_DEFAULT_PASSWORDS = {"pwd", "", "password", "admin", "123456", "12345678"}
+
+
+def _is_weak_password(password: Optional[str]) -> bool:
+    """判断密码是否为不安全的弱默认值（必须拒绝）。"""
+    if not password:
+        return True
+    return password in _WEAK_DEFAULT_PASSWORDS
 
 
 def _mask_password(value: str) -> str:
@@ -198,14 +210,32 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
         if "api_password" in new_config:
             if not isinstance(new_config["api_password"], str):
                 raise HTTPException(status_code=400, detail="API访问密码必须是字符串")
+            # 安全加固：拒绝设置弱默认密码，否则公网部署会被秒破
+            if not _is_placeholder(new_config["api_password"]) and _is_weak_password(new_config["api_password"]):
+                raise HTTPException(
+                    status_code=400,
+                    detail="API访问密码过于简单（禁止空/pwd/password/admin/123456/12345678），请使用更强的密码"
+                )
 
         if "panel_password" in new_config:
             if not isinstance(new_config["panel_password"], str):
                 raise HTTPException(status_code=400, detail="控制面板密码必须是字符串")
+            # 安全加固：拒绝设置弱默认密码
+            if not _is_placeholder(new_config["panel_password"]) and _is_weak_password(new_config["panel_password"]):
+                raise HTTPException(
+                    status_code=400,
+                    detail="控制面板密码过于简单（禁止空/pwd/password/admin/123456/12345678），请使用更强的密码"
+                )
 
         if "password" in new_config:
             if not isinstance(new_config["password"], str):
                 raise HTTPException(status_code=400, detail="访问密码必须是字符串")
+            # 安全加固：拒绝设置弱默认密码
+            if not _is_placeholder(new_config["password"]) and _is_weak_password(new_config["password"]):
+                raise HTTPException(
+                    status_code=400,
+                    detail="访问密码过于简单（禁止空/pwd/password/admin/123456/12345678），请使用更强的密码"
+                )
 
         # 获取环境变量锁定的配置键
         env_locked_keys = get_env_locked_keys()

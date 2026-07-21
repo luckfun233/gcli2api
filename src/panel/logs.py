@@ -5,6 +5,7 @@
 import asyncio
 import datetime
 import os
+import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
@@ -12,7 +13,7 @@ from starlette.websockets import WebSocketState
 
 import config
 from log import log
-from src.utils import verify_panel_token
+from src.utils import verify_panel_token, _is_weak_password
 from .utils import ConnectionManager
 
 
@@ -108,7 +109,18 @@ async def websocket_logs(websocket: WebSocket):
     # 验证 token
     try:
         panel_password = await config.get_panel_password()
-        if token != panel_password:
+
+        # 安全加固：拒绝默认弱密码 "pwd"，公网部署必须配置强密码
+        if _is_weak_password(panel_password):
+            await websocket.close(code=1011, reason="服务端未配置面板密码，拒绝 WebSocket 连接")
+            log.error(
+                "拒绝 WebSocket 连接：检测到默认弱密码。"
+                "请通过环境变量 PANEL_PASSWORD/PASSWORD 配置强密码后重启服务。"
+            )
+            return
+
+        # 使用常量时间比较防止时序攻击
+        if not secrets.compare_digest(token, panel_password):
             await websocket.close(code=403, reason="Invalid authentication token")
             log.warning("WebSocket连接被拒绝: token验证失败")
             return
