@@ -4,10 +4,11 @@
 
 import os
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 
 from log import log
+from src.utils import verify_panel_token
 
 
 # 创建路由器
@@ -15,10 +16,12 @@ router = APIRouter(prefix="/version", tags=["version"])
 
 
 @router.get("/info")
-async def get_version_info(check_update: bool = False):
+async def get_version_info(check_update: bool = False, token: str = Depends(verify_panel_token)):
     """
     获取当前版本信息 - 从version.txt读取
     可选参数 check_update: 是否检查GitHub上的最新版本
+
+    安全加固：需要控制面板密码鉴权，避免匿名用户获取版本指纹。
     """
     try:
         # 获取项目根目录
