@@ -3,6 +3,7 @@
 """
 
 import asyncio
+import secrets
 import socket
 import threading
 import time
@@ -11,6 +12,18 @@ from datetime import timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlparse
+
+# 安全加固：默认弱密码黑名单。当配置密码为此列表中的值时，所有鉴权一律拒绝。
+# 这是为了防止公网部署时用户忘记设置密码、保留默认 "pwd" 导致 1 秒被爆破。
+# 用户必须通过环境变量 API_PASSWORD / PANEL_PASSWORD / PASSWORD 设置一个非弱密码。
+_WEAK_DEFAULT_PASSWORDS = {"pwd", "", "password", "admin", "123456", "12345678"}
+
+
+def _is_weak_password(password: Optional[str]) -> bool:
+    """判断密码是否为不安全的弱默认值（必须拒绝）。"""
+    if not password:
+        return True
+    return password in _WEAK_DEFAULT_PASSWORDS
 
 from config import get_config_value, get_antigravity_api_url
 from log import log
@@ -1044,8 +1057,27 @@ TOKEN_EXPIRY = 3600  # 1小时令牌过期时间
 
 
 async def verify_password(password: str) -> bool:
-    """验证密码（面板登录使用）"""
+    """验证密码（面板登录使用）
+
+    安全加固：
+    1. 使用 secrets.compare_digest 进行常量时间比较，避免时序侧信道攻击恢复密码。
+    2. 拒绝使用默认弱密码 "pwd" 等。公网部署必须通过环境变量配置强密码，
+       否则攻击者可在 1 秒内爆破成功。
+    """
     from config import get_panel_password
 
     correct_password = await get_panel_password()
-    return password == correct_password
+
+    # 拒绝默认弱密码：未配置强密码时一律拒绝登录
+    if _is_weak_password(correct_password):
+        log.error(
+            "拒绝登录：检测到默认弱密码（pwd/空等）。请通过环境变量 "
+            "PANEL_PASSWORD/API_PASSWORD/PASSWORD 配置强密码后重启服务。"
+        )
+        return False
+
+    if not password or not correct_password:
+        return False
+
+    # 常量时间比较，防止时序攻击
+    return secrets.compare_digest(password, correct_password)
