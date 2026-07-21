@@ -2,6 +2,8 @@
 配置路由模块 - 处理 /config/* 相关的HTTP请求
 """
 
+import os
+
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 
@@ -16,6 +18,22 @@ from .utils import get_env_locked_keys
 
 # 创建路由器
 router = APIRouter(prefix="/config", tags=["config"])
+
+# 密码占位符：前端展示用，保存时若值为此占位符或为空则跳过更新
+_PASSWORD_PLACEHOLDER = "********"
+_DEFAULT_WEAK_PASSWORD = "pwd"
+
+
+def _mask_password(value: str) -> str:
+    """密码脱敏：未配置（默认 pwd）返回空串，已配置返回固定占位符。"""
+    if not value or value == _DEFAULT_WEAK_PASSWORD:
+        return ""
+    return _PASSWORD_PLACEHOLDER
+
+
+def _is_placeholder(value: str) -> bool:
+    """判断值是否为占位符或空，保存时应跳过。"""
+    return (not value) or value == _PASSWORD_PLACEHOLDER
 
 
 @router.get("/get")
@@ -65,11 +83,15 @@ async def get_config(token: str = Depends(verify_panel_token)):
         current_config["keepalive_interval"] = await config.get_keepalive_interval()
 
         # 服务器配置
+        # 安全加固：密码字段不返回明文，只返回是否已配置（非默认值），
+        # 前端展示占位符。保存时若值为占位符则不更新。
         current_config["host"] = await config.get_server_host()
         current_config["port"] = await config.get_server_port()
-        current_config["api_password"] = await config.get_api_password()
-        current_config["panel_password"] = await config.get_panel_password()
-        current_config["password"] = await config.get_server_password()
+        current_config["api_password"] = _mask_password(await config.get_api_password())
+        current_config["panel_password"] = _mask_password(await config.get_panel_password())
+        current_config["password"] = _mask_password(await config.get_server_password())
+        current_config["api_password_configured"] = bool(os.getenv("API_PASSWORD") or os.getenv("PASSWORD"))
+        current_config["panel_password_configured"] = bool(os.getenv("PANEL_PASSWORD") or os.getenv("PASSWORD"))
 
         # 从存储系统读取配置
         storage_adapter = await get_storage_adapter()
@@ -189,12 +211,15 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
         env_locked_keys = get_env_locked_keys()
 
         # 直接使用存储适配器保存配置
+        # 安全加固：密码字段若是占位符或空则跳过，避免把脱敏值写回存储
         storage_adapter = await get_storage_adapter()
         for key, value in new_config.items():
             if key not in env_locked_keys:
+                if key in ("password", "api_password", "panel_password") and _is_placeholder(str(value)):
+                    continue
                 await storage_adapter.set_config(key, value)
                 if key in ("password", "api_password", "panel_password"):
-                    log.debug(f"设置{key}字段为: {value}")
+                    log.debug(f"设置{key}字段为: ***")
 
         # 重新加载配置缓存（关键！）
         await config.reload_config()
@@ -211,9 +236,9 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
         test_api_password = await config.get_api_password()
         test_panel_password = await config.get_panel_password()
         test_password = await config.get_server_password()
-        log.debug(f"保存后立即读取的API密码: {test_api_password}")
-        log.debug(f"保存后立即读取的面板密码: {test_panel_password}")
-        log.debug(f"保存后立即读取的通用密码: {test_password}")
+        log.debug(f"保存后立即读取的API密码: {_mask_password(test_api_password)}")
+        log.debug(f"保存后立即读取的面板密码: {_mask_password(test_panel_password)}")
+        log.debug(f"保存后立即读取的通用密码: {_mask_password(test_password)}")
 
         # 构建响应消息
         response_data = {
