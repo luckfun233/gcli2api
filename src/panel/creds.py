@@ -533,6 +533,9 @@ async def verify_credential_project_common(filename: str, mode: str = "geminicli
     """验证并重新获取凭证的project id的通用函数"""
     mode = validate_mode(mode)
 
+    # 安全加固：剥离路径部分，防止路径穿越（如 ../../etc/passwd.json）
+    filename = os.path.basename(filename)
+
     # 验证文件名
     if not filename.endswith(".json"):
         raise HTTPException(status_code=400, detail="无效的文件名")
@@ -711,6 +714,8 @@ async def get_cred_detail(
     """
     try:
         mode = validate_mode(mode)
+        # 安全加固：剥离路径部分，防止路径穿越（如 ../../etc/passwd.json）
+        filename = os.path.basename(filename)
         # 验证文件名
         if not filename.endswith(".json"):
             raise HTTPException(status_code=400, detail="无效的文件名")
@@ -779,6 +784,9 @@ async def creds_action(
 
         filename = request.filename
         action = request.action
+
+        # 安全加固：剥离路径部分，防止路径穿越
+        filename = os.path.basename(filename)
 
         log.info(f"Performing action '{action}' on file: {filename} (mode={mode})")
 
@@ -992,6 +1000,8 @@ async def download_cred_file(
     """下载单个凭证文件"""
     try:
         mode = validate_mode(mode)
+        # 安全加固：剥离路径部分，防止路径穿越
+        filename = os.path.basename(filename)
         # 验证文件名安全性
         if not filename.endswith(".json"):
             raise HTTPException(status_code=404, detail="无效的文件名")
@@ -1031,6 +1041,8 @@ async def fetch_user_email(
     """获取指定凭证文件的用户邮箱地址"""
     try:
         mode = validate_mode(mode)
+        # 安全加固：剥离路径部分，防止路径穿越
+        filename = os.path.basename(filename)
         return await fetch_user_email_common(filename, mode=mode)
     except HTTPException:
         raise
@@ -1098,6 +1110,8 @@ async def verify_credential_project(
     """
     try:
         mode = validate_mode(mode)
+        # 安全加固：剥离路径部分，防止路径穿越
+        filename = os.path.basename(filename)
         return await verify_credential_project_common(filename, mode=mode)
     except HTTPException:
         raise
@@ -1124,6 +1138,9 @@ async def get_credential_errors(
     """
     try:
         mode = validate_mode(mode)
+
+        # 安全加固：剥离路径部分，防止路径穿越
+        filename = os.path.basename(filename)
 
         # 验证文件名
         if not filename.endswith(".json"):
@@ -1161,6 +1178,8 @@ async def get_credential_quota(
     """
     try:
         mode = validate_mode(mode)
+        # 安全加固：剥离路径部分，防止路径穿越
+        filename = os.path.basename(filename)
         # 验证文件名
         if not filename.endswith(".json"):
             raise HTTPException(status_code=400, detail="无效的文件名")
@@ -1246,6 +1265,9 @@ async def configure_preview_channel(
                 status_code=400,
                 detail="配置 preview 通道仅支持 geminicli 模式"
             )
+
+        # 安全加固：剥离路径部分，防止路径穿越
+        filename = os.path.basename(filename)
 
         # 验证文件名
         if not filename.endswith(".json"):
@@ -1468,6 +1490,9 @@ async def test_credential(
     """
     try:
         mode = validate_mode(mode)
+
+        # 安全加固：剥离路径部分，防止路径穿越
+        filename = os.path.basename(filename)
 
         # 验证文件名
         if not filename.endswith(".json"):
