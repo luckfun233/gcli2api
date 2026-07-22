@@ -57,11 +57,95 @@ async def lifespan(app: FastAPI):
     # 安全加固：检测弱默认密码，拒绝启动（fail-fast）
     # 弱密码包括：空、pwd、password、admin、123456、12345678
     # 公网部署下这些密码会在 1 秒内被扫描器爆破
+    # M4: 补充"hash 对应弱密码"的检查 —— argon2 hash 本身不算弱，但需检查它是否对应已知弱密码
     try:
         from src.auth import _is_weak_password
+
+        async def _check_weak_password_against_hash(stored: str) -> bool:
+            """如果 stored 是 argon2 hash，检查它是否对应已知弱密码。返回 True 表示是弱密码。"""
+            if not stored or not stored.startswith("$argon2"):
+                return False
+            try:
+                from argon2 import PasswordHasher
+                from argon2.exceptions import VerifyMismatchError
+                _hasher = PasswordHasher()
+                for weak in ["", "pwd", "password", "admin", "123456", "12345678"]:
+                    try:
+                        _hasher.verify(stored, weak)
+                        return True  # hash 对应弱密码
+                    except VerifyMismatchError:
+                        continue
+                    except Exception:
+                        continue
+            except ImportError:
+                log.error("argon2-cffi 未安装，无法检查 hash 密码。请运行: pip install argon2-cffi")
+                # 缺 argon2 库时 fail-fast，避免 hash 模式下无人能验证
+                return True
+            except Exception as e:
+                log.warning(f"hash 弱密码检查异常: {e}")
+            return False
+
+        async def _migrate_plaintext_passwords() -> None:
+            """M4 一次性迁移：把 DB 中的明文密码 hash 化。
+
+            只迁移 DB 配置表里的密码字段；环境变量配置的明文密码不在此处理
+            （环境变量在 HF Secret 中加密存储，明文形式可接受；提供 *_HASH
+            形式让 paranoid 用户可以完全不落明明文密码）。
+            """
+            try:
+                from argon2 import PasswordHasher
+                _hasher = PasswordHasher()
+            except ImportError:
+                log.warning("argon2-cffi 未安装，跳过 M4 明文密码迁移")
+                return
+
+            fields = [
+                ("api_password", config.get_api_password),
+                ("panel_password", config.get_panel_password),
+                ("password", config.get_server_password),
+            ]
+            # 仅迁移非环境变量来源（即 DB 配置）的密码
+            env_locked = {
+                k for k, v in {
+                    "api_password": os.getenv("API_PASSWORD") or os.getenv("API_PASSWORD_HASH"),
+                    "panel_password": os.getenv("PANEL_PASSWORD") or os.getenv("PANEL_PASSWORD_HASH"),
+                    "password": os.getenv("PASSWORD") or os.getenv("SERVER_PASSWORD_HASH"),
+                }.items() if v
+            }
+
+            from src.storage_adapter import get_storage_adapter
+            adapter = await get_storage_adapter()
+            migrated = []
+            for field, getter in fields:
+                if field in env_locked:
+                    continue  # 环境变量锁定，不迁移
+                val = config._config_cache.get(field, "") if hasattr(config, "_config_cache") else ""
+                if not val:
+                    # _config_cache 里没有则尝试 getter
+                    try:
+                        val = await getter()
+                    except Exception:
+                        val = ""
+                if val and not val.startswith("$argon2") and not _is_weak_password(val):
+                    try:
+                        hashed = _hasher.hash(val)
+                        await adapter.set_config(field, hashed)
+                        migrated.append(field)
+                    except Exception as e:
+                        log.warning(f"M4 迁移字段 {field} 失败: {e}")
+            if migrated:
+                # 重新加载配置缓存
+                await config.reload_config()
+                log.warning(f"M4 迁移：已将以下明文密码字段 hash 化: {migrated}")
+
         api_pwd = await config.get_api_password()
         panel_pwd = await config.get_panel_password()
-        if _is_weak_password(api_pwd) or _is_weak_password(panel_pwd):
+        if (
+            _is_weak_password(api_pwd)
+            or _is_weak_password(panel_pwd)
+            or await _check_weak_password_against_hash(api_pwd)
+            or await _check_weak_password_against_hash(panel_pwd)
+        ):
             log.error("=" * 60)
             log.error("启动失败：检测到弱密码或未配置密码")
             log.error("公网部署下弱密码会在 1 秒内被扫描器爆破成功。")
@@ -75,6 +159,9 @@ async def lifespan(app: FastAPI):
             sys.exit(1)
         else:
             log.info("密码强度检查通过")
+
+        # M4: 一次性明文密码迁移（DB 中明文 → argon2 hash）
+        await _migrate_plaintext_passwords()
     except SystemExit:
         raise
     except Exception as e:

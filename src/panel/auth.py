@@ -2,6 +2,7 @@
 认证路由模块 - 处理 /auth/* 相关的HTTP请求
 """
 
+import hashlib
 import secrets
 import time
 from collections import defaultdict
@@ -23,6 +24,7 @@ from src.models import (
     AuthCallbackRequest,
     AuthCallbackUrlRequest,
 )
+from src.storage_adapter import get_storage_adapter
 from src.utils import verify_panel_token
 
 
@@ -112,9 +114,25 @@ def _login_clear_failures(client_ip: str) -> None:
     _login_blocked_until.pop(client_ip, None)
 
 
+# M1: Session 配置
+_SESSION_TTL_SEC = 7 * 86400  # 7 天绝对过期
+
+
+def _hash_password(password: str) -> str:
+    """计算密码的 SHA-256 hash（用于 session 的 password_hash 字段）。
+
+    注意：这是 session 内部用于"密码改后失效判断"的 hash，与 M4 的 argon2 hash
+    不是一回事 —— M1 不依赖 M4，session 创建时密码还在内存中。
+    """
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
 @router.post("/login")
 async def login(request: LoginRequest, http_request: Request):
-    """用户登录（简化版：直接返回密码作为token）
+    """用户登录
+
+    M1 改造：登录成功后返回独立的服务端 session token（而非明文密码），
+    原密码不再直接作为 token 使用。
 
     安全加固：每 IP 5 分钟内最多失败 10 次，超过则冷却 10 分钟。
     """
@@ -126,8 +144,34 @@ async def login(request: LoginRequest, http_request: Request):
 
         if await verify_password(request.password):
             _login_clear_failures(client_ip)
-            # 直接使用密码作为token，简化认证流程
-            return JSONResponse(content={"token": request.password, "message": "登录成功"})
+            # M1: 创建 session，token 字段装的是 session_id（兼容前端字段名）
+            session_id = secrets.token_urlsafe(32)
+            password_hash = _hash_password(request.password)
+            now = time.time()
+            expires_at = now + _SESSION_TTL_SEC
+            try:
+                adapter = await get_storage_adapter()
+                await adapter.create_session(
+                    session_id=session_id,
+                    password_hash=password_hash,
+                    expires_at=expires_at,
+                    client_ip=client_ip,
+                    user_agent=http_request.headers.get("user-agent", ""),
+                )
+            except Exception as e:
+                log.error(f"创建 session 失败，回退到密码直连: {e}")
+                # DB 不可用时回退到旧逻辑（保证可用性），但记日志告警
+                return JSONResponse(
+                    content={"token": request.password, "message": "登录成功"}
+                )
+            return JSONResponse(
+                content={
+                    "token": session_id,  # 兼容前端字段名
+                    "session_id": session_id,
+                    "expires_at": expires_at,
+                    "message": "登录成功",
+                }
+            )
         else:
             _login_record_failure(client_ip)
             raise HTTPException(status_code=401, detail="密码错误")
@@ -135,6 +179,53 @@ async def login(request: LoginRequest, http_request: Request):
         raise
     except Exception as e:
         log.error(f"登录失败: {e}")
+        raise HTTPException(status_code=500, detail="内部服务器错误，请查看服务端日志")
+
+
+@router.post("/logout")
+async def logout(token: str = Depends(verify_panel_token)):
+    """登出当前 session（M1）
+
+    verify_panel_token 返回的 token 可能是 session_id（M1 模式）或明文密码
+    （fallback 模式）。仅当为 session 模式时调用 delete_session。
+    """
+    try:
+        adapter = await get_storage_adapter()
+        session = await adapter.get_session(token)
+        if session:
+            await adapter.delete_session(token)
+            return JSONResponse(content={"message": "已登出"})
+        # fallback 模式（token 是明文密码）：客户端清 localStorage 即可
+        return JSONResponse(content={"message": "已登出"})
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"登出失败: {e}")
+        raise HTTPException(status_code=500, detail="内部服务器错误，请查看服务端日志")
+
+
+@router.get("/sessions")
+async def list_sessions(token: str = Depends(verify_panel_token)):
+    """列出当前密码下的所有活跃 session（M1，可选 UI 管理用）
+
+    不返回 session_id 本身（避免泄露后可劫持）。
+    """
+    try:
+        adapter = await get_storage_adapter()
+        # 通过当前 session 反查 password_hash
+        current_session = await adapter.get_session(token)
+        if not current_session:
+            # fallback 模式（明文密码直连），无 session 列表
+            return JSONResponse(content={"sessions": []})
+        password_hash = current_session.get("password_hash", "")
+        if not password_hash:
+            return JSONResponse(content={"sessions": []})
+        sessions = await adapter.list_sessions_by_password_hash(password_hash)
+        return JSONResponse(content={"sessions": sessions})
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"列出 session 失败: {e}")
         raise HTTPException(status_code=500, detail="内部服务器错误，请查看服务端日志")
 
 

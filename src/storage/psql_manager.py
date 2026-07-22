@@ -129,6 +129,19 @@ class PSQLManager:
             )
         """)
 
+        # M1: Session 表
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL,
+                created_at DOUBLE PRECISION NOT NULL,
+                expires_at DOUBLE PRECISION NOT NULL,
+                last_active_at DOUBLE PRECISION NOT NULL,
+                client_ip TEXT,
+                user_agent TEXT
+            )
+        """)
+
         # 索引
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_disabled ON credentials(disabled)
@@ -141,6 +154,12 @@ class PSQLManager:
         """)
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_ag_rotation_order ON antigravity_credentials(rotation_order)
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sessions_password_hash ON sessions(password_hash)
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at)
         """)
 
         log.debug("PostgreSQL tables and indexes created")
@@ -877,6 +896,137 @@ class PSQLManager:
         except Exception as e:
             log.error(f"Error deleting config {key}: {e}")
             return False
+
+    # ============ Session 管理（M1）============
+
+    async def create_session(
+        self,
+        session_id: str,
+        password_hash: str,
+        expires_at: float,
+        client_ip: str,
+        user_agent: str,
+    ) -> None:
+        """创建 session"""
+        self._ensure_initialized()
+        try:
+            now = time.time()
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO sessions
+                        (session_id, password_hash, created_at, expires_at, last_active_at, client_ip, user_agent)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (session_id) DO UPDATE SET
+                        password_hash = EXCLUDED.password_hash,
+                        created_at = EXCLUDED.created_at,
+                        expires_at = EXCLUDED.expires_at,
+                        last_active_at = EXCLUDED.last_active_at,
+                        client_ip = EXCLUDED.client_ip,
+                        user_agent = EXCLUDED.user_agent
+                    """,
+                    session_id, password_hash, now, expires_at, now, client_ip, user_agent,
+                )
+        except Exception as e:
+            log.error(f"Error creating session: {e}")
+            raise
+
+    async def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """获取 session 文档"""
+        self._ensure_initialized()
+        try:
+            async with self._pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT session_id, password_hash, created_at, expires_at, last_active_at
+                    FROM sessions WHERE session_id = $1
+                    """,
+                    session_id,
+                )
+                if not row:
+                    return None
+                return {
+                    "_id": row["session_id"],
+                    "password_hash": row["password_hash"],
+                    "created_at": row["created_at"],
+                    "expires_at": row["expires_at"],
+                    "last_active_at": row["last_active_at"],
+                }
+        except Exception as e:
+            log.error(f"Error getting session: {e}")
+            return None
+
+    async def touch_session(
+        self, session_id: str, last_active_at: float, new_expires_at: float
+    ) -> None:
+        """更新 last_active_at 和 expires_at"""
+        self._ensure_initialized()
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE sessions SET last_active_at = $1, expires_at = $2
+                    WHERE session_id = $3
+                    """,
+                    last_active_at, new_expires_at, session_id,
+                )
+        except Exception as e:
+            log.error(f"Error touching session: {e}")
+
+    async def delete_session(self, session_id: str) -> None:
+        """删除 session"""
+        self._ensure_initialized()
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.execute("DELETE FROM sessions WHERE session_id = $1", session_id)
+        except Exception as e:
+            log.error(f"Error deleting session: {e}")
+
+    async def delete_sessions_by_password_hash(self, password_hash: str) -> int:
+        """按 password_hash 批量删除 session"""
+        self._ensure_initialized()
+        try:
+            async with self._pool.acquire() as conn:
+                result = await conn.execute(
+                    "DELETE FROM sessions WHERE password_hash = $1", password_hash
+                )
+                # asyncpg 返回 'DELETE N' 格式
+                try:
+                    return int(result.split()[-1])
+                except Exception:
+                    return 0
+        except Exception as e:
+            log.error(f"Error deleting sessions by password_hash: {e}")
+            return 0
+
+    async def list_sessions_by_password_hash(self, password_hash: str) -> List[Dict[str, Any]]:
+        """列出该 password_hash 下所有未过期 session"""
+        self._ensure_initialized()
+        try:
+            now = time.time()
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT created_at, last_active_at, expires_at, client_ip, user_agent
+                    FROM sessions
+                    WHERE password_hash = $1 AND expires_at > $2
+                    ORDER BY last_active_at DESC
+                    """,
+                    password_hash, now,
+                )
+                return [
+                    {
+                        "created_at": r["created_at"],
+                        "last_active_at": r["last_active_at"],
+                        "expires_at": r["expires_at"],
+                        "client_ip": r["client_ip"],
+                        "user_agent": r["user_agent"],
+                    }
+                    for r in rows
+                ]
+        except Exception as e:
+            log.error(f"Error listing sessions by password_hash: {e}")
+            return []
 
     async def get_credential_errors(self, filename: str, mode: str = "geminicli") -> Dict[str, Any]:
         """获取凭证的错误信息"""

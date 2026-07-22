@@ -250,6 +250,28 @@ class SQLiteManager:
             )
         """)
 
+        # M1: Session 表
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                last_active_at REAL NOT NULL,
+                client_ip TEXT,
+                user_agent TEXT
+            )
+        """)
+        # TTL 自动清理：SQLite 没有原生 TTL，索引仅用于查询加速
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sessions_password_hash
+            ON sessions(password_hash)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sessions_expires_at
+            ON sessions(expires_at)
+        """)
+
         log.debug("SQLite tables and indexes created")
 
     async def _repair_credential_filenames(self, db: aiosqlite.Connection):
@@ -1173,6 +1195,132 @@ class SQLiteManager:
         except Exception as e:
             log.error(f"Error deleting config {key}: {e}")
             return False
+
+    # ============ Session 管理（M1）============
+
+    async def create_session(
+        self,
+        session_id: str,
+        password_hash: str,
+        expires_at: float,
+        client_ip: str,
+        user_agent: str,
+    ) -> None:
+        """创建 session"""
+        self._ensure_initialized()
+        try:
+            now = time.time()
+            async with aiosqlite.connect(self._db_path) as db:
+                await db.execute(
+                    """
+                    INSERT OR REPLACE INTO sessions
+                        (session_id, password_hash, created_at, expires_at, last_active_at, client_ip, user_agent)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (session_id, password_hash, now, expires_at, now, client_ip, user_agent),
+                )
+                await db.commit()
+        except Exception as e:
+            log.error(f"Error creating session: {e}")
+            raise
+
+    async def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """获取 session 文档"""
+        self._ensure_initialized()
+        try:
+            async with aiosqlite.connect(self._db_path) as db:
+                async with db.execute(
+                    """
+                    SELECT session_id, password_hash, created_at, expires_at, last_active_at
+                    FROM sessions WHERE session_id = ?
+                    """,
+                    (session_id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    if not row:
+                        return None
+                    return {
+                        "_id": row[0],
+                        "password_hash": row[1],
+                        "created_at": row[2],
+                        "expires_at": row[3],
+                        "last_active_at": row[4],
+                    }
+        except Exception as e:
+            log.error(f"Error getting session: {e}")
+            return None
+
+    async def touch_session(
+        self, session_id: str, last_active_at: float, new_expires_at: float
+    ) -> None:
+        """更新 last_active_at 和 expires_at"""
+        self._ensure_initialized()
+        try:
+            async with aiosqlite.connect(self._db_path) as db:
+                await db.execute(
+                    """
+                    UPDATE sessions SET last_active_at = ?, expires_at = ?
+                    WHERE session_id = ?
+                    """,
+                    (last_active_at, new_expires_at, session_id),
+                )
+                await db.commit()
+        except Exception as e:
+            log.error(f"Error touching session: {e}")
+
+    async def delete_session(self, session_id: str) -> None:
+        """删除 session"""
+        self._ensure_initialized()
+        try:
+            async with aiosqlite.connect(self._db_path) as db:
+                await db.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+                await db.commit()
+        except Exception as e:
+            log.error(f"Error deleting session: {e}")
+
+    async def delete_sessions_by_password_hash(self, password_hash: str) -> int:
+        """按 password_hash 批量删除 session"""
+        self._ensure_initialized()
+        try:
+            async with aiosqlite.connect(self._db_path) as db:
+                cursor = await db.execute(
+                    "DELETE FROM sessions WHERE password_hash = ?", (password_hash,)
+                )
+                await db.commit()
+                return cursor.rowcount or 0
+        except Exception as e:
+            log.error(f"Error deleting sessions by password_hash: {e}")
+            return 0
+
+    async def list_sessions_by_password_hash(self, password_hash: str) -> List[Dict[str, Any]]:
+        """列出该 password_hash 下所有未过期 session"""
+        self._ensure_initialized()
+        try:
+            now = time.time()
+            async with aiosqlite.connect(self._db_path) as db:
+                async with db.execute(
+                    """
+                    SELECT created_at, last_active_at, expires_at, client_ip, user_agent
+                    FROM sessions
+                    WHERE password_hash = ? AND expires_at > ?
+                    ORDER BY last_active_at DESC
+                    """,
+                    (password_hash, now),
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                    return [
+                        {
+                            "created_at": r[0],
+                            "last_active_at": r[1],
+                            "expires_at": r[2],
+                            "client_ip": r[3],
+                            "user_agent": r[4],
+                        }
+                        for r in rows
+                    ]
+        except Exception as e:
+            log.error(f"Error listing sessions by password_hash: {e}")
+            return []
 
     async def get_credential_errors(self, filename: str, mode: str = "geminicli") -> Dict[str, Any]:
         """

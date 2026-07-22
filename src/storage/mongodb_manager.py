@@ -146,6 +146,24 @@ class MongoDBManager:
             if "already exists" not in str(e).lower():
                 log.warning(f"Index creation warning: {e}")
 
+        # ===== M1: Session 集合索引 =====
+        try:
+            sessions_collection = self._db["sessions"]
+            # TTL 索引：自动清理过期 session
+            sessions_collection.create_index(
+                [("expires_at", ASCENDING)],
+                expireAfterSeconds=0,
+                name="idx_expires_at_ttl",
+            )
+            # 按 password_hash 查询（改密码时批量失效）
+            sessions_collection.create_index(
+                [("password_hash", ASCENDING)], name="idx_password_hash"
+            )
+            log.debug("MongoDB sessions indexes created successfully")
+        except Exception as e:
+            if "already exists" not in str(e).lower():
+                log.warning(f"Sessions index creation warning: {e}")
+
     async def _load_config_cache(self):
         """加载配置到内存缓存（仅在初始化时调用一次）"""
         if self._config_loaded:
@@ -1306,6 +1324,131 @@ class MongoDBManager:
         except Exception as e:
             log.error(f"Error deleting config {key}: {e}")
             return False
+
+    # ============ Session 管理（M1）============
+
+    async def create_session(
+        self,
+        session_id: str,
+        password_hash: str,
+        expires_at: float,
+        client_ip: str,
+        user_agent: str,
+    ) -> None:
+        """创建 session（_id 为字符串 session_id）"""
+        self._ensure_initialized()
+        try:
+            sessions_collection = self._db["sessions"]
+            now = time.time()
+            await sessions_collection.insert_one(
+                {
+                    "_id": session_id,
+                    "password_hash": password_hash,
+                    "created_at": now,
+                    "expires_at": expires_at,
+                    "last_active_at": now,
+                    "client_ip": client_ip,
+                    "user_agent": user_agent,
+                }
+            )
+        except Exception as e:
+            log.error(f"Error creating session: {e}")
+            raise
+
+    async def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """获取 session 文档（不返回 client_ip/user_agent）"""
+        self._ensure_initialized()
+        try:
+            sessions_collection = self._db["sessions"]
+            doc = await sessions_collection.find_one(
+                {"_id": session_id},
+                {
+                    "_id": 1,
+                    "password_hash": 1,
+                    "created_at": 1,
+                    "expires_at": 1,
+                    "last_active_at": 1,
+                },
+            )
+            return doc
+        except Exception as e:
+            log.error(f"Error getting session: {e}")
+            return None
+
+    async def touch_session(
+        self, session_id: str, last_active_at: float, new_expires_at: float
+    ) -> None:
+        """更新 last_active_at 和 expires_at"""
+        self._ensure_initialized()
+        try:
+            sessions_collection = self._db["sessions"]
+            await sessions_collection.update_one(
+                {"_id": session_id},
+                {
+                    "$set": {
+                        "last_active_at": last_active_at,
+                        "expires_at": new_expires_at,
+                    }
+                },
+            )
+        except Exception as e:
+            log.error(f"Error touching session: {e}")
+
+    async def delete_session(self, session_id: str) -> None:
+        """删除 session"""
+        self._ensure_initialized()
+        try:
+            sessions_collection = self._db["sessions"]
+            await sessions_collection.delete_one({"_id": session_id})
+        except Exception as e:
+            log.error(f"Error deleting session: {e}")
+
+    async def delete_sessions_by_password_hash(self, password_hash: str) -> int:
+        """按 password_hash 批量删除 session"""
+        self._ensure_initialized()
+        try:
+            sessions_collection = self._db["sessions"]
+            result = await sessions_collection.delete_many(
+                {"password_hash": password_hash}
+            )
+            return result.deleted_count
+        except Exception as e:
+            log.error(f"Error deleting sessions by password_hash: {e}")
+            return 0
+
+    async def list_sessions_by_password_hash(self, password_hash: str) -> List[Dict[str, Any]]:
+        """列出该 password_hash 下所有未过期 session"""
+        self._ensure_initialized()
+        try:
+            sessions_collection = self._db["sessions"]
+            now = time.time()
+            cursor = sessions_collection.find(
+                {"password_hash": password_hash, "expires_at": {"$gt": now}},
+                {
+                    "_id": 1,
+                    "created_at": 1,
+                    "last_active_at": 1,
+                    "expires_at": 1,
+                    "client_ip": 1,
+                    "user_agent": 1,
+                },
+            )
+            result = []
+            async for doc in cursor:
+                # 不返回 _id 本身（避免泄露后可劫持）
+                result.append(
+                    {
+                        "created_at": doc.get("created_at"),
+                        "last_active_at": doc.get("last_active_at"),
+                        "expires_at": doc.get("expires_at"),
+                        "client_ip": doc.get("client_ip"),
+                        "user_agent": doc.get("user_agent"),
+                    }
+                )
+            return result
+        except Exception as e:
+            log.error(f"Error listing sessions by password_hash: {e}")
+            return []
 
     async def get_credential_errors(self, filename: str, mode: str = "geminicli") -> Dict[str, Any]:
         """

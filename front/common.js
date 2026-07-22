@@ -8,6 +8,7 @@
 const AppState = {
     // 认证相关
     authToken: '',
+    sessionExpiresAt: null, // M1: session 绝对过期时间（秒）
     authInProgress: false,
     currentProjectId: '',
 
@@ -150,6 +151,8 @@ function createCredsManager(type) {
                     }
                     showStatus(msg, 'success');
                 } else {
+                    // M1: 401 session 失效统一处理
+                    if (handleAuthFailure(response.status)) return;
                     showStatus(`加载失败: ${data.detail || data.error || '未知错误'}`, 'error');
                 }
             } catch (error) {
@@ -611,6 +614,17 @@ function getAuthHeaders() {
     };
 }
 
+// M1: 统一 401 处理 —— session 失效时清除本地凭证并跳转登录页
+function handleAuthFailure(statusCode) {
+    if (statusCode !== 401) return false;
+    localStorage.removeItem('gcli2api_auth_token');
+    localStorage.removeItem('gcli2api_session_expires_at');
+    AppState.authToken = '';
+    showStatus('登录已失效，请重新登录', 'error');
+    setTimeout(() => location.reload(), 1500);
+    return true;
+}
+
 function formatFileSize(bytes) {
     if (bytes < 1024) return bytes + ' B';
     if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + ' KB';
@@ -848,7 +862,12 @@ async function login() {
         const data = await response.json();
 
         if (response.ok) {
+            // M1: token 字段装的是 session_id；额外保存 expires_at 用于本地过期检查
             AppState.authToken = data.token;
+            if (data.expires_at) {
+                AppState.sessionExpiresAt = data.expires_at;
+                localStorage.setItem('gcli2api_session_expires_at', String(data.expires_at));
+            }
             localStorage.setItem('gcli2api_auth_token', AppState.authToken);
             document.getElementById('loginSection').classList.add('hidden');
             document.getElementById('mainSection').classList.remove('hidden');
@@ -866,6 +885,15 @@ async function login() {
 async function autoLogin() {
     const savedToken = localStorage.getItem('gcli2api_auth_token');
     if (!savedToken) return false;
+
+    // M1: 本地检查 session 是否已过期（避免发出注定 401 的请求）
+    const savedExpiresAt = localStorage.getItem('gcli2api_session_expires_at');
+    if (savedExpiresAt && (Date.now() / 1000) > parseFloat(savedExpiresAt)) {
+        localStorage.removeItem('gcli2api_auth_token');
+        localStorage.removeItem('gcli2api_session_expires_at');
+        showStatus('登录已过期，请重新登录', 'info');
+        return false;
+    }
 
     AppState.authToken = savedToken;
 
@@ -885,7 +913,9 @@ async function autoLogin() {
             requestAnimationFrame(() => initTabSlider());
             return true;
         } else if (response.status === 401) {
+            // M1: session 失效，清除本地凭证
             localStorage.removeItem('gcli2api_auth_token');
+            localStorage.removeItem('gcli2api_session_expires_at');
             AppState.authToken = '';
             return false;
         }
@@ -895,8 +925,20 @@ async function autoLogin() {
     }
 }
 
-function logout() {
+async function logout() {
+    // M1: 调用 /auth/logout 让服务端删除 session（若是 session 模式）
+    try {
+        if (AppState.authToken) {
+            await fetch('./auth/logout', {
+                method: 'POST',
+                headers: getAuthHeaders(),
+            });
+        }
+    } catch (e) {
+        // 网络错误也继续清本地凭证
+    }
     localStorage.removeItem('gcli2api_auth_token');
+    localStorage.removeItem('gcli2api_session_expires_at');
     AppState.authToken = '';
     document.getElementById('loginSection').classList.remove('hidden');
     document.getElementById('mainSection').classList.add('hidden');

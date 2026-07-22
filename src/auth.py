@@ -20,9 +20,15 @@ _WEAK_DEFAULT_PASSWORDS = {"pwd", "", "password", "admin", "123456", "12345678"}
 
 
 def _is_weak_password(password: Optional[str]) -> bool:
-    """判断密码是否为不安全的弱默认值（必须拒绝）。"""
+    """判断密码是否为不安全的弱默认值（必须拒绝）。
+
+    M4 改造：argon2 hash 不算弱密码（即使对应明文是弱的，也在 verify 阶段拦截）。
+    """
     if not password:
         return True
+    # M4: argon2 hash 形式的密码不算弱密码
+    if password.startswith("$argon2"):
+        return False
     return password in _WEAK_DEFAULT_PASSWORDS
 
 from config import get_config_value, get_antigravity_api_url
@@ -1057,18 +1063,24 @@ TOKEN_EXPIRY = 3600  # 1小时令牌过期时间
 
 
 async def verify_password(password: str) -> bool:
-    """验证密码（面板登录使用）
+    """验证密码（面板登录 / API 鉴权共用）
+
+    M4 改造：支持明文和 argon2 hash 两种存储形式。
+    - 明文模式（环境变量配置明文 / DB 未迁移）：使用 secrets.compare_digest 常量时间比较。
+    - hash 模式（DB 中存 argon2 hash / *_PASSWORD_HASH 环境变量）：调用 argon2.verify。
 
     安全加固：
-    1. 使用 secrets.compare_digest 进行常量时间比较，避免时序侧信道攻击恢复密码。
-    2. 拒绝使用默认弱密码 "pwd" 等。公网部署必须通过环境变量配置强密码，
+    1. 拒绝使用默认弱密码 "pwd" 等。公网部署必须通过环境变量配置强密码，
        否则攻击者可在 1 秒内爆破成功。
+    2. 明文模式使用 secrets.compare_digest 防止时序侧信道攻击。
+    3. argon2 自带常量时间特性。
     """
     from config import get_panel_password
 
     correct_password = await get_panel_password()
 
     # 拒绝默认弱密码：未配置强密码时一律拒绝登录
+    # M4: hash 形式的密码不算弱密码（_is_weak_password 内部已处理）
     if _is_weak_password(correct_password):
         log.error(
             "拒绝登录：检测到默认弱密码（pwd/空等）。请通过环境变量 "
@@ -1079,5 +1091,23 @@ async def verify_password(password: str) -> bool:
     if not password or not correct_password:
         return False
 
-    # 常量时间比较，防止时序攻击
+    # M4: hash 模式（argon2）
+    if correct_password.startswith("$argon2"):
+        try:
+            from argon2 import PasswordHasher
+            from argon2.exceptions import VerifyMismatchError
+            _hasher = PasswordHasher()
+            try:
+                _hasher.verify(correct_password, password)
+                return True
+            except VerifyMismatchError:
+                return False
+        except ImportError:
+            log.error("argon2-cffi 未安装，无法验证 hash 密码。请运行: pip install argon2-cffi")
+            return False
+        except Exception as e:
+            log.error(f"argon2 验证异常: {e}")
+            return False
+
+    # 明文模式：常量时间比较，防止时序攻击
     return secrets.compare_digest(password, correct_password)

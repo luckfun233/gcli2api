@@ -43,8 +43,11 @@ ENV_MAPPINGS = {
     "HOST": "host",
     "PORT": "port",
     "API_PASSWORD": "api_password",
+    "API_PASSWORD_HASH": "api_password",  # M4: hash 形式环境变量，与 API_PASSWORD 同键
     "PANEL_PASSWORD": "panel_password",
+    "PANEL_PASSWORD_HASH": "panel_password",  # M4: hash 形式环境变量
     "PASSWORD": "password",
+    "SERVER_PASSWORD_HASH": "password",  # M4: hash 形式环境变量（password 字段）
     "KEEPALIVE_URL": "keepalive_url",
     "KEEPALIVE_INTERVAL": "keepalive_interval",
 }
@@ -234,15 +237,23 @@ async def get_api_password() -> str:
     """
     Get API password setting for chat endpoints.
 
-    Environment variable: API_PASSWORD
+    M4: 优先级（高 → 低）：
+        API_PASSWORD_HASH > API_PASSWORD > PASSWORD > DB 配置 > ''（启动弱密码检测拒绝）
+
+    返回值可能是明文密码，也可能是 argon2 hash 字符串。调用方需根据是否以
+    `$argon2` 开头判断处理方式。
+
+    Environment variable: API_PASSWORD_HASH / API_PASSWORD / PASSWORD
     Database config key: api_password
-    Default: Uses PASSWORD env var for compatibility, otherwise '' (startup will refuse)
     """
-    # 优先使用 API_PASSWORD，如果没有则使用通用 PASSWORD 保证兼容性
+    # M4: 优先 hash 形式环境变量
+    hash_env = os.getenv("API_PASSWORD_HASH", "")
+    if hash_env:
+        return str(hash_env)
+    # 其次明文环境变量
     api_password = await get_config_value("api_password", None, "API_PASSWORD")
     if api_password is not None:
         return str(api_password)
-
     # 兼容性：使用通用密码（默认空字符串，启动时弱密码检测会拒绝启动）
     return str(await get_config_value("password", "", "PASSWORD"))
 
@@ -251,15 +262,23 @@ async def get_panel_password() -> str:
     """
     Get panel password setting for web interface.
 
-    Environment variable: PANEL_PASSWORD
+    M4: 优先级（高 → 低）：
+        PANEL_PASSWORD_HASH > PANEL_PASSWORD > PASSWORD > DB 配置 > ''（启动弱密码检测拒绝）
+
+    返回值可能是明文密码，也可能是 argon2 hash 字符串。调用方需根据是否以
+    `$argon2` 开头判断处理方式。
+
+    Environment variable: PANEL_PASSWORD_HASH / PANEL_PASSWORD / PASSWORD
     Database config key: panel_password
-    Default: Uses PASSWORD env var for compatibility, otherwise '' (startup will refuse)
     """
-    # 优先使用 PANEL_PASSWORD，如果没有则使用通用 PASSWORD 保证兼容性
+    # M4: 优先 hash 形式环境变量
+    hash_env = os.getenv("PANEL_PASSWORD_HASH", "")
+    if hash_env:
+        return str(hash_env)
+    # 其次明文环境变量
     panel_password = await get_config_value("panel_password", None, "PANEL_PASSWORD")
     if panel_password is not None:
         return str(panel_password)
-
     # 兼容性：使用通用密码（默认空字符串，启动时弱密码检测会拒绝启动）
     return str(await get_config_value("password", "", "PASSWORD"))
 
@@ -268,10 +287,16 @@ async def get_server_password() -> str:
     """
     Get server password setting (deprecated, use get_api_password or get_panel_password).
 
-    Environment variable: PASSWORD
+    M4: 优先级（高 → 低）：
+        SERVER_PASSWORD_HASH > PASSWORD > DB 配置 > ''（启动弱密码检测拒绝）
+
+    Environment variable: SERVER_PASSWORD_HASH / PASSWORD
     Database config key: password
-    Default: "" (empty, startup will refuse to boot with weak password)
     """
+    # M4: 优先 hash 形式环境变量
+    hash_env = os.getenv("SERVER_PASSWORD_HASH", "")
+    if hash_env:
+        return str(hash_env)
     return str(await get_config_value("password", "", "PASSWORD"))
 
 

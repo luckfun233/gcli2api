@@ -2,6 +2,7 @@
 配置路由模块 - 处理 /config/* 相关的HTTP请求
 """
 
+import hashlib
 import os
 from typing import Optional
 
@@ -28,16 +29,27 @@ _DEFAULT_WEAK_PASSWORD = "pwd"
 # 通过 /config/save 设置这些值时一律拒绝，避免运维误操作把服务变成裸奔状态。
 _WEAK_DEFAULT_PASSWORDS = {"pwd", "", "password", "admin", "123456", "12345678"}
 
+# M4: 密码字段集合，保存时需 hash 化，读取时需脱敏
+_PASSWORD_FIELDS = ("api_password", "panel_password", "server_password")
+
 
 def _is_weak_password(password: Optional[str]) -> bool:
-    """判断密码是否为不安全的弱默认值（必须拒绝）。"""
+    """判断密码是否为不安全的弱默认值（必须拒绝）。
+
+    M4: argon2 hash 不算弱密码。
+    """
     if not password:
         return True
+    if password.startswith("$argon2"):
+        return False
     return password in _WEAK_DEFAULT_PASSWORDS
 
 
 def _mask_password(value: str) -> str:
-    """密码脱敏：未配置（默认 pwd）返回空串，已配置返回固定占位符。"""
+    """密码脱敏：未配置（默认 pwd）返回空串，已配置返回固定占位符。
+
+    M4 后 DB 中存的是 hash，但仍统一返回占位符（不暴露 hash 也不暴露明文）。
+    """
     if not value or value == _DEFAULT_WEAK_PASSWORD:
         return ""
     return _PASSWORD_PLACEHOLDER
@@ -46,6 +58,13 @@ def _mask_password(value: str) -> str:
 def _is_placeholder(value: str) -> bool:
     """判断值是否为占位符或空，保存时应跳过。"""
     return (not value) or value == _PASSWORD_PLACEHOLDER
+
+
+def _hash_password_for_storage(plain: str) -> str:
+    """M4: 使用 argon2id hash 密码用于落盘。失败时抛异常。"""
+    from argon2 import PasswordHasher
+    hasher = PasswordHasher()
+    return hasher.hash(plain)
 
 
 @router.get("/get")
@@ -240,19 +259,60 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
         # 获取环境变量锁定的配置键
         env_locked_keys = get_env_locked_keys()
 
+        # M1: 在密码字段被改写前，记录"旧密码 hash"，改完后批量清理对应 session。
+        #   注意：环境变量锁定的密码字段不能通过 /config/save 改写，无需清理 session。
+        _password_keys_to_clear_sessions = []  # [(key, old_password_hash), ...]
+        for key in ("password", "api_password", "panel_password"):
+            if key in new_config and key not in env_locked_keys:
+                if not _is_placeholder(str(new_config[key])):
+                    # 用户确实要改密码，记录旧密码的 SHA-256 hash（用于 session 失效）
+                    old_plain = ""
+                    if key == "api_password":
+                        old_plain = await config.get_api_password()
+                    elif key == "panel_password":
+                        old_plain = await config.get_panel_password()
+                    elif key == "password":
+                        old_plain = await config.get_server_password()
+                    if old_plain and not old_plain.startswith("$argon2"):
+                        old_hash = hashlib.sha256(old_plain.encode("utf-8")).hexdigest()
+                        _password_keys_to_clear_sessions.append(old_hash)
+
         # 直接使用存储适配器保存配置
         # 安全加固：密码字段若是占位符或空则跳过，避免把脱敏值写回存储
+        # M4: 密码字段在写入前 hash 化（argon2id），DB 中不再存明文
         storage_adapter = await get_storage_adapter()
         for key, value in new_config.items():
             if key not in env_locked_keys:
                 if key in ("password", "api_password", "panel_password") and _is_placeholder(str(value)):
                     continue
-                await storage_adapter.set_config(key, value)
+                # M4: 密码字段 hash 化
                 if key in ("password", "api_password", "panel_password"):
-                    log.debug(f"设置{key}字段为: ***")
+                    plain = str(value)
+                    # 如果已经是 hash 形式（不应发生在正常流程），不再二次 hash
+                    if not plain.startswith("$argon2"):
+                        try:
+                            value = _hash_password_for_storage(plain)
+                        except Exception as e:
+                            log.error(f"hash 密码失败 {key}: {e}")
+                            raise HTTPException(
+                                status_code=500, detail="密码加密失败，请查看服务端日志"
+                            )
+                    log.debug(f"设置{key}字段为: *** (argon2 hash)")
+                await storage_adapter.set_config(key, value)
 
         # 重新加载配置缓存（关键！）
         await config.reload_config()
+
+        # M1: 密码修改联动 —— 清理所有旧密码创建的 session，强制重登
+        if _password_keys_to_clear_sessions:
+            try:
+                cleared = 0
+                for old_hash in _password_keys_to_clear_sessions:
+                    cleared += await storage_adapter.delete_sessions_by_password_hash(old_hash)
+                if cleared:
+                    log.info(f"密码已修改，清理 {cleared} 个旧 session，强制重登")
+            except Exception as e:
+                log.warning(f"清理旧 session 失败（不影响密码修改）: {e}")
 
         # 如果保活相关配置发生变化，立即重启保活服务
         keepalive_keys = {"keepalive_url", "keepalive_interval"}

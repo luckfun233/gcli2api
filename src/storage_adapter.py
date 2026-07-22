@@ -8,6 +8,7 @@
 import asyncio
 import json
 import os
+import time
 from typing import Any, Dict, List, Optional, Protocol
 
 from log import log
@@ -69,6 +70,41 @@ class StorageBackend(Protocol):
 
     async def delete_config(self, key: str) -> bool:
         """删除配置项"""
+        ...
+
+    # ============ Session 管理（M1）============
+
+    async def create_session(
+        self,
+        session_id: str,
+        password_hash: str,
+        expires_at: float,
+        client_ip: str,
+        user_agent: str,
+    ) -> None:
+        """创建 session"""
+        ...
+
+    async def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """获取 session 文档，不存在返回 None"""
+        ...
+
+    async def touch_session(
+        self, session_id: str, last_active_at: float, new_expires_at: float
+    ) -> None:
+        """更新 last_active_at 和 expires_at（滚动续期）"""
+        ...
+
+    async def delete_session(self, session_id: str) -> None:
+        """删除 session"""
+        ...
+
+    async def delete_sessions_by_password_hash(self, password_hash: str) -> int:
+        """按 password_hash 批量删除 session，返回删除数量"""
+        ...
+
+    async def list_sessions_by_password_hash(self, password_hash: str) -> List[Dict[str, Any]]:
+        """列出该 password_hash 下所有未过期 session"""
         ...
 
 
@@ -218,6 +254,117 @@ class StorageAdapter:
         """删除配置项"""
         self._ensure_initialized()
         return await self._backend.delete_config(key)
+
+    # ============ Session 管理（M1）============
+
+    async def create_session(
+        self,
+        session_id: str,
+        password_hash: str,
+        expires_at: float,
+        client_ip: str,
+        user_agent: str,
+    ) -> None:
+        """创建 session"""
+        self._ensure_initialized()
+        if hasattr(self._backend, "create_session"):
+            return await self._backend.create_session(
+                session_id, password_hash, expires_at, client_ip, user_agent
+            )
+        # 通用 fallback：用 config 表前缀存储 session（用于不支持原生 session 的后端）
+        await self._backend.set_config(
+            f"__session__{session_id}",
+            {
+                "password_hash": password_hash,
+                "created_at": time.time(),
+                "expires_at": expires_at,
+                "last_active_at": time.time(),
+                "client_ip": client_ip,
+                "user_agent": user_agent,
+            },
+        )
+
+    async def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """获取 session 文档，不存在返回 None。
+
+        返回字段：_id, password_hash, created_at, expires_at, last_active_at
+        不返回 client_ip/user_agent（避免无谓暴露给鉴权层）。
+        """
+        self._ensure_initialized()
+        if hasattr(self._backend, "get_session"):
+            return await self._backend.get_session(session_id)
+        raw = await self._backend.get_config(f"__session__{session_id}")
+        if not raw:
+            return None
+        return {
+            "_id": session_id,
+            "password_hash": raw.get("password_hash"),
+            "created_at": raw.get("created_at"),
+            "expires_at": raw.get("expires_at"),
+            "last_active_at": raw.get("last_active_at"),
+        }
+
+    async def touch_session(
+        self, session_id: str, last_active_at: float, new_expires_at: float
+    ) -> None:
+        """更新 last_active_at 和 expires_at（滚动续期）"""
+        self._ensure_initialized()
+        if hasattr(self._backend, "touch_session"):
+            return await self._backend.touch_session(
+                session_id, last_active_at, new_expires_at
+            )
+        raw = await self._backend.get_config(f"__session__{session_id}")
+        if not raw:
+            return
+        raw["last_active_at"] = last_active_at
+        raw["expires_at"] = new_expires_at
+        await self._backend.set_config(f"__session__{session_id}", raw)
+
+    async def delete_session(self, session_id: str) -> None:
+        """删除 session"""
+        self._ensure_initialized()
+        if hasattr(self._backend, "delete_session"):
+            return await self._backend.delete_session(session_id)
+        await self._backend.delete_config(f"__session__{session_id}")
+
+    async def delete_sessions_by_password_hash(self, password_hash: str) -> int:
+        """按 password_hash 批量删除 session，返回删除数量"""
+        self._ensure_initialized()
+        if hasattr(self._backend, "delete_sessions_by_password_hash"):
+            return await self._backend.delete_sessions_by_password_hash(password_hash)
+        # 通用 fallback：遍历所有 config 找出 session
+        all_cfg = await self._backend.get_all_config()
+        deleted = 0
+        for key, value in all_cfg.items():
+            if isinstance(key, str) and key.startswith("__session__"):
+                if isinstance(value, dict) and value.get("password_hash") == password_hash:
+                    await self._backend.delete_config(key)
+                    deleted += 1
+        return deleted
+
+    async def list_sessions_by_password_hash(self, password_hash: str) -> List[Dict[str, Any]]:
+        """列出该 password_hash 下所有未过期 session"""
+        self._ensure_initialized()
+        if hasattr(self._backend, "list_sessions_by_password_hash"):
+            return await self._backend.list_sessions_by_password_hash(password_hash)
+        all_cfg = await self._backend.get_all_config()
+        now = time.time()
+        sessions: List[Dict[str, Any]] = []
+        for key, value in all_cfg.items():
+            if isinstance(key, str) and key.startswith("__session__"):
+                if isinstance(value, dict) and value.get("password_hash") == password_hash:
+                    if value.get("expires_at", 0) > now:
+                        sessions.append(
+                            {
+                                "_id": key[len("__session__") :],
+                                "created_at": value.get("created_at"),
+                                "last_active_at": value.get("last_active_at"),
+                                "expires_at": value.get("expires_at"),
+                                "client_ip": value.get("client_ip"),
+                                "user_agent": value.get("user_agent"),
+                            }
+                        )
+        return sessions
 
     # ============ 工具方法 ============
 

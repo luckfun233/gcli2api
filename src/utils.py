@@ -1,6 +1,8 @@
 from typing import List, Optional
 
+import hashlib
 import secrets
+import time
 
 from config import get_api_password, get_panel_password
 from fastapi import Depends, HTTPException, Header, Query, Request, status
@@ -17,9 +19,15 @@ _WEAK_DEFAULT_PASSWORDS = {"pwd", "", "password", "admin", "123456", "12345678"}
 
 
 def _is_weak_password(password: Optional[str]) -> bool:
-    """判断密码是否为不安全的弱默认值（必须拒绝）。"""
+    """判断密码是否为不安全的弱默认值（必须拒绝）。
+
+    M4 改造：argon2 hash 不算弱密码（即使对应明文是弱的，也在 verify 阶段拦截）。
+    """
     if not password:
         return True
+    # M4: argon2 hash 形式的密码不算弱密码
+    if password.startswith("$argon2"):
+        return False
     return password in _WEAK_DEFAULT_PASSWORDS
 
 # ====================== OAuth Configuration ======================
@@ -214,6 +222,7 @@ async def authenticate_flexible(
 
     # 安全加固：拒绝默认弱密码。若服务端密码为默认 "pwd" 等弱值，
     # 一律拒绝所有 API 调用，避免公网部署被秒破。
+    # M4: hash 形式的密码不算弱密码（hash 本身是强随机串），弱密码判断在 verify 阶段做。
     if _is_weak_password(password):
         log.error(
             "拒绝 API 鉴权：服务端配置了默认弱密码（pwd/空等）。"
@@ -273,8 +282,9 @@ async def authenticate_flexible(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # 验证 token：使用常量时间比较防止时序攻击
-    if not secrets.compare_digest(token, password):
+    # M4: 验证 token —— 调用 verify_password 支持明文 / argon2 hash 两种存储形式
+    from src.auth import verify_password as _verify_api_password
+    if not await _verify_api_password(token):
         log.debug(f"Authentication failed using {auth_method}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -295,26 +305,65 @@ authenticate_gemini_flexible = authenticate_flexible
 
 # ====================== Panel Authentication Functions ======================
 
+# M1: session 滚动续期 TTL（与登录时 7 天保持一致）
+_SESSION_TTL_SEC = 7 * 86400
+
+
 async def verify_panel_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
     """
-    简化的控制面板密码验证函数
+    控制面板鉴权（M1 双轨过渡 + M4 兼容）
 
-    直接验证Bearer token是否等于控制面板密码
-
-    安全加固：
-    1. 拒绝默认弱密码 "pwd" 等，公网部署必须配置强密码。
-    2. 使用 secrets.compare_digest 进行常量时间比较，防止时序侧信道攻击。
+    M1 改造：
+    1. 优先尝试 session 鉴权（token 即 session_id），命中则滚动续期并返回 session_id。
+    2. session 查询失败或未命中时，fallback 到密码直连（调用 verify_password，
+       支持 M4 的明文 / argon2 hash 两种存储形式）。
+    3. 过渡期 fallback 在 M1 上线 30 天后应移除，强制走 session（见下方 TODO）。
 
     Args:
         credentials: HTTPAuthorizationCredentials 自动注入
 
     Returns:
-        验证通过的token
+        session_id（session 模式）或明文密码（fallback 模式）。
+        调用方无需关心返回的是哪种，只用作"已认证"标记。
 
     Raises:
-        HTTPException: 密码错误时抛出401异常
+        HTTPException: 鉴权失败时抛出 401 / 503
     """
+    token = credentials.credentials
 
+    # 1. 优先尝试 session 鉴权（M1）
+    try:
+        from src.storage_adapter import get_storage_adapter
+        adapter = await get_storage_adapter()
+        session = await adapter.get_session(token)
+        if session:
+            now = time.time()
+            # 检查是否过期
+            if session.get("expires_at", 0) <= now:
+                await adapter.delete_session(token)  # 顺手清理
+                raise HTTPException(status_code=401, detail="session 已过期，请重新登录")
+            # M1 风险点补充：校验 password_hash 是否匹配当前密码
+            # （环境变量改密码 / DB 改密码后，旧 session 因 hash 不匹配而失效）
+            current_password = await get_panel_password()
+            current_password_hash = hashlib.sha256(
+                current_password.encode("utf-8")
+            ).hexdigest()
+            if session.get("password_hash") and session["password_hash"] != current_password_hash:
+                await adapter.delete_session(token)
+                raise HTTPException(status_code=401, detail="密码已变更，请重新登录")
+            # 滚动续期（最多续到 7 天）
+            new_expires = min(now + _SESSION_TTL_SEC, session.get("last_active_at", now) + _SESSION_TTL_SEC + 86400)
+            await adapter.touch_session(token, now, new_expires)
+            return token  # 返回 session_id
+    except HTTPException:
+        raise
+    except Exception as e:
+        # session 查询失败要 fallback 到密码，避免 DB 抖动导致全员登出
+        log.error(f"session 鉴权查询失败，将尝试密码 fallback: {e}")
+
+    # 2. 过渡期 fallback：直接比对密码（M4: verify_password 内部处理明文/hash）
+    # TODO(M1): M1 上线 30 天后移除此 fallback 分支，强制走 session 模式。
+    #           移除前应在面板日志里统计 fallback 命中次数，若仍有流量则延长过渡期并告警。
     password = await get_panel_password()
 
     # 拒绝默认弱密码：未配置强密码时一律拒绝面板访问
@@ -328,7 +377,10 @@ async def verify_panel_token(credentials: HTTPAuthorizationCredentials = Depends
             detail="服务端未配置面板密码，拒绝访问。请联系管理员设置 PANEL_PASSWORD 环境变量。",
         )
 
-    # 常量时间比较，防止时序攻击
-    if not secrets.compare_digest(credentials.credentials, password):
-        raise HTTPException(status_code=401, detail="密码错误")
-    return credentials.credentials
+    # M4: 调用 verify_password 支持 argon2 hash
+    from src.auth import verify_password as _verify_panel_password
+    if await _verify_panel_password(token):
+        log.warning("检测到旧客户端密码直连 fallback 命中，请升级到 session 模式")
+        return token  # 返回密码（兼容老客户端）
+
+    raise HTTPException(status_code=401, detail="密码错误或 session 无效")
