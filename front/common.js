@@ -2454,9 +2454,36 @@ async function deduplicateAntigravityByEmail() {
 // =====================================================================
 // WebSocket日志相关
 // =====================================================================
-function connectWebSocket() {
+async function connectWebSocket() {
     if (AppState.logWebSocket && AppState.logWebSocket.readyState === WebSocket.OPEN) {
         showStatus('WebSocket已经连接', 'info');
+        return;
+    }
+
+    document.getElementById('connectionStatusText').textContent = '连接中...';
+    document.getElementById('logConnectionStatus').className = 'status info';
+
+    // M2 安全加固：先用 Bearer token 换取一次性 ws-ticket，再用 ticket 建立 WebSocket。
+    // 避免将长期凭证（面板密码）放入 URL query 而被日志/Referer/历史记录泄露。
+    let ticket;
+    try {
+        const resp = await fetch('./auth/ws-ticket', {
+            method: 'POST',
+            headers: getAuthHeaders(),
+        });
+        if (!resp.ok) {
+            const text = await resp.text().catch(() => '');
+            throw new Error(`换取 ws-ticket 失败 (${resp.status}): ${text}`);
+        }
+        const data = await resp.json();
+        ticket = data.ticket;
+        if (!ticket) {
+            throw new Error('服务端未返回 ws-ticket');
+        }
+    } catch (error) {
+        showStatus('获取 WebSocket 票据失败: ' + error.message, 'error');
+        document.getElementById('connectionStatusText').textContent = '连接失败';
+        document.getElementById('logConnectionStatus').className = 'status error';
         return;
     }
 
@@ -2464,11 +2491,8 @@ function connectWebSocket() {
         const wsPath = new URL('./logs/stream', window.location.href).href;
         const wsUrl = wsPath.replace(/^http/, 'ws');
 
-        // 添加 token 认证参数
-        const wsUrlWithAuth = `${wsUrl}?token=${encodeURIComponent(AppState.authToken)}`;
-
-        document.getElementById('connectionStatusText').textContent = '连接中...';
-        document.getElementById('logConnectionStatus').className = 'status info';
+        // 使用一次性 ticket 认证（30s 内有效，单次使用）
+        const wsUrlWithAuth = `${wsUrl}?ticket=${encodeURIComponent(ticket)}`;
 
         AppState.logWebSocket = new WebSocket(wsUrlWithAuth);
 

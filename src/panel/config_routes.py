@@ -121,7 +121,7 @@ async def get_config(token: str = Depends(verify_panel_token)):
 
     except Exception as e:
         log.error(f"获取配置失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="内部服务器错误，请查看服务端日志")
 
 
 @router.post("/save")
@@ -282,4 +282,4 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
         raise
     except Exception as e:
         log.error(f"保存配置失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="内部服务器错误，请查看服务端日志")

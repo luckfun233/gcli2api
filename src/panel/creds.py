@@ -85,7 +85,7 @@ async def extract_json_files_from_zip(zip_file: UploadFile) -> List[dict]:
         raise HTTPException(status_code=400, detail="无效的ZIP文件格式")
     except Exception as e:
         log.error(f"处理ZIP文件失败: {e}")
-        raise HTTPException(status_code=500, detail=f"处理ZIP文件失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="处理ZIP文件失败，请查看服务端日志")
 
 
 async def clear_all_model_cooldowns_for_credential(
@@ -655,7 +655,7 @@ async def upload_credentials(
         raise
     except Exception as e:
         log.error(f"批量上传失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="内部服务器错误，请查看服务端日志")
 
 
 @router.get("/status")
@@ -699,7 +699,7 @@ async def get_creds_status(
         raise
     except Exception as e:
         log.error(f"获取凭证状态失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="内部服务器错误，请查看服务端日志")
 
 
 @router.get("/detail/{filename}")
@@ -767,7 +767,7 @@ async def get_cred_detail(
         raise
     except Exception as e:
         log.error(f"获取凭证详情失败 {filename}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="内部服务器错误，请查看服务端日志")
 
 
 @router.post("/action")
@@ -842,7 +842,7 @@ async def creds_action(
                     raise HTTPException(status_code=500, detail="删除凭证失败")
             except Exception as e:
                 log.error(f"删除凭证 {filename} 时出错: {e}")
-                raise HTTPException(status_code=500, detail=f"删除文件失败: {str(e)}")
+                raise HTTPException(status_code=500, detail="删除文件失败，请查看服务端日志")
 
         elif action == "enable_credit":
             if mode != "antigravity":
@@ -873,7 +873,7 @@ async def creds_action(
         raise
     except Exception as e:
         log.error(f"凭证文件操作失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="内部服务器错误，请查看服务端日志")
 
 
 @router.post("/batch-action")
@@ -988,7 +988,7 @@ async def creds_batch_action(
         raise
     except Exception as e:
         log.error(f"批量凭证文件操作失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="内部服务器错误，请查看服务端日志")
 
 
 @router.get("/download/{filename}")
@@ -1029,7 +1029,7 @@ async def download_cred_file(
         raise
     except Exception as e:
         log.error(f"下载凭证文件失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="内部服务器错误，请查看服务端日志")
 
 
 @router.post("/fetch-email/{filename}")
@@ -1048,7 +1048,7 @@ async def fetch_user_email(
         raise
     except Exception as e:
         log.error(f"获取用户邮箱失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="内部服务器错误，请查看服务端日志")
 
 
 @router.post("/refresh-all-emails")
@@ -1062,7 +1062,7 @@ async def refresh_all_user_emails(
         return await refresh_all_user_emails_common(mode=mode)
     except Exception as e:
         log.error(f"批量获取用户邮箱失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="内部服务器错误，请查看服务端日志")
 
 
 @router.post("/deduplicate-by-email")
@@ -1076,7 +1076,7 @@ async def deduplicate_credentials_by_email(
         return await deduplicate_credentials_by_email_common(mode=mode)
     except Exception as e:
         log.error(f"批量去重凭证失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="内部服务器错误，请查看服务端日志")
 
 
 @router.get("/download-all")
@@ -1095,7 +1095,7 @@ async def download_all_creds(
         raise
     except Exception as e:
         log.error(f"打包下载失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="内部服务器错误，请查看服务端日志")
 
 
 @router.post("/verify-project/{filename}")
@@ -1117,7 +1117,7 @@ async def verify_credential_project(
         raise
     except Exception as e:
         log.error(f"检验凭证Project ID失败 {filename}: {e}")
-        raise HTTPException(status_code=500, detail=f"检验失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="检验失败，请查看服务端日志")
 
 
 @router.get("/errors/{filename}")
@@ -1164,7 +1164,7 @@ async def get_credential_errors(
         raise
     except Exception as e:
         log.error(f"获取凭证错误信息失败 {filename}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="内部服务器错误，请查看服务端日志")
 
 
 @router.get("/quota/{filename}")
@@ -1235,7 +1235,7 @@ async def get_credential_quota(
         raise
     except Exception as e:
         log.error(f"获取凭证额度失败 {filename}: {e}")
-        raise HTTPException(status_code=500, detail=f"获取额度失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="获取额度失败，请查看服务端日志")
 
 
 @router.post("/configure-preview/{filename}")
@@ -1466,7 +1466,7 @@ async def configure_preview_channel(
         raise
     except Exception as e:
         log.error(f"配置 preview 通道失败 {filename}: {e}")
-        raise HTTPException(status_code=500, detail=f"配置失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="配置失败，请查看服务端日志")
 
 
 @router.post("/test/{filename}")
@@ -1663,4 +1663,4 @@ async def test_credential(
         raise
     except Exception as e:
         log.error(f"测试凭证失败 {filename}: {e}")
-        raise HTTPException(status_code=500, detail=f"测试失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="测试失败，请查看服务端日志")

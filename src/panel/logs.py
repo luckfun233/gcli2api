@@ -5,15 +5,14 @@
 import asyncio
 import datetime
 import os
-import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.websockets import WebSocketState
 
-import config
 from log import log
-from src.utils import verify_panel_token, _is_weak_password
+from src.utils import verify_panel_token
+from .auth import consume_ws_ticket
 from .utils import ConnectionManager
 
 
@@ -50,7 +49,7 @@ async def clear_logs(token: str = Depends(verify_panel_token)):
                 )
             except Exception as e:
                 log.error(f"清空日志文件失败: {e}")
-                raise HTTPException(status_code=500, detail=f"清空日志文件失败: {str(e)}")
+                raise HTTPException(status_code=500, detail="清空日志文件失败，请查看服务端日志")
         else:
             return JSONResponse(content={"message": "日志文件不存在"})
 
@@ -92,37 +91,31 @@ async def download_logs(token: str = Depends(verify_panel_token)):
         raise
     except Exception as e:
         log.error(f"下载日志文件失败: {e}")
-        raise HTTPException(status_code=500, detail=f"下载日志文件失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="下载日志文件失败，请查看服务端日志")
 
 
 @router.websocket("/stream")
 async def websocket_logs(websocket: WebSocket):
-    """WebSocket端点，用于实时日志流"""
-    # WebSocket 认证: 从查询参数获取 token
-    token = websocket.query_params.get("token")
+    """WebSocket端点，用于实时日志流
 
-    if not token:
-        await websocket.close(code=403, reason="Missing authentication token")
-        log.warning("WebSocket连接被拒绝: 缺少认证token")
+    M2 安全加固：认证改用一次性 ws-ticket，不再接受 ?token=xxx。
+    - 客户端先 POST /auth/ws-ticket（带 Bearer 头）换取 30s 短时 ticket
+    - 再用 ?ticket=xxx 建立连接；ticket 单次使用，立刻消费
+    - 避免长期凭证（面板密码）出现在 URL 而被日志/Referer/历史记录泄露
+    """
+    # WebSocket 认证: 从查询参数获取一次性 ticket
+    ticket = websocket.query_params.get("ticket")
+
+    if not ticket:
+        await websocket.close(code=403, reason="Missing authentication ticket")
+        log.warning("WebSocket连接被拒绝: 缺少 ticket")
         return
 
-    # 验证 token
+    # 校验并消费 ticket（一次性，常量时间校验内部 token）
     try:
-        panel_password = await config.get_panel_password()
-
-        # 安全加固：拒绝默认弱密码 "pwd"，公网部署必须配置强密码
-        if _is_weak_password(panel_password):
-            await websocket.close(code=1011, reason="服务端未配置面板密码，拒绝 WebSocket 连接")
-            log.error(
-                "拒绝 WebSocket 连接：检测到默认弱密码。"
-                "请通过环境变量 PANEL_PASSWORD/PASSWORD 配置强密码后重启服务。"
-            )
-            return
-
-        # 使用常量时间比较防止时序攻击
-        if not secrets.compare_digest(token, panel_password):
-            await websocket.close(code=403, reason="Invalid authentication token")
-            log.warning("WebSocket连接被拒绝: token验证失败")
+        if not consume_ws_ticket(ticket):
+            await websocket.close(code=403, reason="Invalid or expired ticket")
+            log.warning("WebSocket连接被拒绝: ticket 无效或已过期")
             return
     except Exception as e:
         await websocket.close(code=1011, reason="Authentication error")

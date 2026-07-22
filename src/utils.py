@@ -6,6 +6,7 @@ from config import get_api_password, get_panel_password
 from fastapi import Depends, HTTPException, Header, Query, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from log import log
+from src.ratelimit import check_token_rate_limit
 
 # HTTP Bearer security scheme
 security = HTTPBearer()
@@ -279,6 +280,9 @@ async def authenticate_flexible(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="密码错误"
         )
+
+    # M6: Token 维度限流（认证通过后）。防止凭证被盗后高频刷量。
+    check_token_rate_limit(token)
 
     log.debug(f"Authentication successful using {auth_method}")
     return token

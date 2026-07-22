@@ -236,15 +236,15 @@ async def get_api_password() -> str:
 
     Environment variable: API_PASSWORD
     Database config key: api_password
-    Default: Uses PASSWORD env var for compatibility, otherwise 'pwd'
+    Default: Uses PASSWORD env var for compatibility, otherwise '' (startup will refuse)
     """
     # 优先使用 API_PASSWORD，如果没有则使用通用 PASSWORD 保证兼容性
     api_password = await get_config_value("api_password", None, "API_PASSWORD")
     if api_password is not None:
         return str(api_password)
 
-    # 兼容性：使用通用密码
-    return str(await get_config_value("password", "pwd", "PASSWORD"))
+    # 兼容性：使用通用密码（默认空字符串，启动时弱密码检测会拒绝启动）
+    return str(await get_config_value("password", "", "PASSWORD"))
 
 
 async def get_panel_password() -> str:
@@ -253,15 +253,15 @@ async def get_panel_password() -> str:
 
     Environment variable: PANEL_PASSWORD
     Database config key: panel_password
-    Default: Uses PASSWORD env var for compatibility, otherwise 'pwd'
+    Default: Uses PASSWORD env var for compatibility, otherwise '' (startup will refuse)
     """
     # 优先使用 PANEL_PASSWORD，如果没有则使用通用 PASSWORD 保证兼容性
     panel_password = await get_config_value("panel_password", None, "PANEL_PASSWORD")
     if panel_password is not None:
         return str(panel_password)
 
-    # 兼容性：使用通用密码
-    return str(await get_config_value("password", "pwd", "PASSWORD"))
+    # 兼容性：使用通用密码（默认空字符串，启动时弱密码检测会拒绝启动）
+    return str(await get_config_value("password", "", "PASSWORD"))
 
 
 async def get_server_password() -> str:
@@ -270,9 +270,9 @@ async def get_server_password() -> str:
 
     Environment variable: PASSWORD
     Database config key: password
-    Default: pwd
+    Default: "" (empty, startup will refuse to boot with weak password)
     """
-    return str(await get_config_value("password", "pwd", "PASSWORD"))
+    return str(await get_config_value("password", "", "PASSWORD"))
 
 
 async def get_credentials_dir() -> str:

@@ -2,6 +2,7 @@
 认证路由模块 - 处理 /auth/* 相关的HTTP请求
 """
 
+import secrets
 import time
 from collections import defaultdict
 
@@ -34,6 +35,51 @@ _LOGIN_MAX_FAILURES = 10  # 窗口内最多失败次数
 _LOGIN_COOLDOWN_SEC = 600  # 触发后冷却 10 分钟
 _login_failures: dict[str, list[float]] = defaultdict(list)
 _login_blocked_until: dict[str, float] = {}
+
+
+# =============================================================================
+# M2: WebSocket 一次性票据（ws-ticket）机制
+# =============================================================================
+# 背景：原本 WebSocket 通过 URL query ?token=xxx 传递面板密码，会被
+#   - 浏览器历史记录、Nginx access log、Referer 头、CDN 日志等记录
+#   - 一旦泄露等同于密码泄露
+# 方案：客户端先用 Bearer token 调用 /auth/ws-ticket 换取 30s 一次性 ticket，
+#   再用 ?ticket=xxx 建立 WebSocket。ticket 单次使用、短 TTL，泄露后无法重放。
+# 存储：内存 dict（单 worker 场景足够；多 worker 部署见 M1 session 改造方案）。
+_WS_TICKET_TTL_SEC = 30  # 票据有效期 30 秒
+_ws_tickets: dict[str, dict] = {}  # ticket -> {"expires_at": float, "used": bool}
+
+
+def _cleanup_expired_ws_tickets() -> None:
+    """惰性清理过期/已使用的 ticket，避免内存无限增长。"""
+    now = time.time()
+    expired = [
+        t for t, info in _ws_tickets.items()
+        if info["expires_at"] <= now or info["used"]
+    ]
+    for t in expired:
+        _ws_tickets.pop(t, None)
+
+
+def consume_ws_ticket(ticket: str) -> bool:
+    """校验并一次性消费 ws-ticket。成功返回 True，失败返回 False。"""
+    if not ticket:
+        return False
+    _cleanup_expired_ws_tickets()
+    info = _ws_tickets.get(ticket)
+    if not info:
+        return False
+    if info["used"]:
+        # 已使用的 ticket 直接清除（防重放）
+        _ws_tickets.pop(ticket, None)
+        return False
+    if info["expires_at"] <= time.time():
+        _ws_tickets.pop(ticket, None)
+        return False
+    # 标记为已使用（一次性消费）
+    info["used"] = True
+    _ws_tickets.pop(ticket, None)  # 立即移除，杜绝重放
+    return True
 
 
 def _login_check_blocked(client_ip: str) -> bool:
@@ -89,7 +135,34 @@ async def login(request: LoginRequest, http_request: Request):
         raise
     except Exception as e:
         log.error(f"登录失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="内部服务器错误，请查看服务端日志")
+
+
+@router.post("/ws-ticket")
+async def issue_ws_ticket(token: str = Depends(verify_panel_token)):
+    """签发一次性短时 WebSocket 票据（M2）
+
+    客户端用 Bearer token 调用本端点换取 30 秒内有效的 ws-ticket，
+    再用 `?ticket=xxx` 建立 WebSocket 连接。ticket 单次使用、不可重放，
+    避免将长期凭证（面板密码）放入 URL query 而被日志/历史记录泄露。
+
+    依赖 verify_panel_token 自动校验 Authorization: Bearer <password>。
+    """
+    try:
+        _cleanup_expired_ws_tickets()
+        ticket = secrets.token_urlsafe(32)
+        _ws_tickets[ticket] = {
+            "expires_at": time.time() + _WS_TICKET_TTL_SEC,
+            "used": False,
+        }
+        return JSONResponse(
+            content={"ticket": ticket, "expires_in": _WS_TICKET_TTL_SEC}
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"签发 ws-ticket 失败: {e}")
+        raise HTTPException(status_code=500, detail="内部服务器错误，请查看服务端日志")
 
 
 @router.post("/start")
@@ -123,7 +196,7 @@ async def start_auth(request: AuthStartRequest, token: str = Depends(verify_pane
         raise
     except Exception as e:
         log.error(f"开始认证流程失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="内部服务器错误，请查看服务端日志")
 
 
 @router.post("/callback")
@@ -175,7 +248,7 @@ async def auth_callback(request: AuthCallbackRequest, token: str = Depends(verif
         raise
     except Exception as e:
         log.error(f"处理认证回调失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="内部服务器错误，请查看服务端日志")
 
 
 @router.post("/callback-url")
@@ -224,7 +297,7 @@ async def auth_callback_url(request: AuthCallbackUrlRequest, token: str = Depend
         raise
     except Exception as e:
         log.error(f"从回调URL处理认证失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="内部服务器错误，请查看服务端日志")
 
 
 @router.get("/status/{project_id}")
@@ -239,4 +312,4 @@ async def check_auth_status(project_id: str, token: str = Depends(verify_panel_t
 
     except Exception as e:
         log.error(f"检查认证状态失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="内部服务器错误，请查看服务端日志")
